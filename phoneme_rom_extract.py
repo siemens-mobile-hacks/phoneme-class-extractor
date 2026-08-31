@@ -42,6 +42,13 @@ PRIMITIVE_BY_BASIC_TYPE = {
     4: "Z", 5: "C", 6: "F", 7: "D", 8: "B", 9: "S", 10: "I", 11: "J"
 }
 
+CORE_ARRAY_BY_CLASS_ID = {
+    0: "[Ljava/lang/Object;",
+    3: "[Ljava/lang/String;",
+    4: "[Z", 5: "[C", 6: "[F", 7: "[D",
+    8: "[B", 9: "[S", 10: "[I", 11: "[J",
+}
+
 
 def align4(value: int) -> int:
     return (value + 3) & ~3
@@ -99,6 +106,7 @@ class ClassInfo:
     fields_pointer: int
     interfaces_pointer: int
     constants_pointer: int
+    vtable_pointer: int
     java_class_pointer: Optional[int] = None
     super_pointer: Optional[int] = None
     element_pointer: Optional[int] = None
@@ -230,15 +238,18 @@ class ROMExtractor:
             return None
         constants_pointer = 0
         interfaces_pointer = 0
+        vtable_pointer = 0
         if not is_array:
             newer_constants = self.image.u32o(offset + 32)
             older_constants = self.image.u32o(offset + 28)
             if self._plausible_constant_pool(newer_constants):
                 constants_pointer = newer_constants
                 interfaces_pointer = self.image.u32o(offset + 28)
+                vtable_pointer = self.image.flash_base + offset + 36
             elif self._plausible_constant_pool(older_constants):
                 constants_pointer = older_constants
                 interfaces_pointer = self.image.u32o(offset + 24)
+                vtable_pointer = self.image.flash_base + offset + 32
             else:
                 return None
         return ClassInfo(
@@ -255,6 +266,7 @@ class ROMExtractor:
             fields_pointer=self.image.u32o(offset + 20) if not is_array else 0,
             interfaces_pointer=interfaces_pointer,
             constants_pointer=constants_pointer,
+            vtable_pointer=vtable_pointer,
             array_basic_type=self.image.u32o(offset + 16) if is_array else None,
         )
 
@@ -410,6 +422,10 @@ class ROMExtractor:
             return match[1] if match else None
 
         def descriptor(info: ClassInfo) -> str:
+            core_name = CORE_ARRAY_BY_CLASS_ID.get(info.class_id)
+            if core_name is not None:
+                info.name = core_name
+                return core_name
             if info.name is not None:
                 return info.name if info.name.startswith("[") else f"L{info.name};"
             if info.class_id in resolving:
@@ -700,6 +716,9 @@ class ROMExtractor:
         if pos + 1 >= len(raw) or raw[pos + 1] < 0x80:
             raise ValueError("bad encoded class id")
         class_id = ((first & 0x7f) << 7) | (raw[pos + 1] & 0x7f)
+        core_array = CORE_ARRAY_BY_CLASS_ID.get(class_id)
+        if core_array is not None:
+            return core_array, pos + 2
         info = self.classes.get(class_id)
         if info is None or info.name is None:
             return f"Lunknown/Class{class_id};", pos + 2
@@ -1395,6 +1414,8 @@ def infer_quick_field_owners(extractor: ROMExtractor, info: ClassInfo,
         if not descriptor or not descriptor.startswith("L") or not descriptor.endswith(";"):
             return None
         name = descriptor[1:-1]
+        if name == "java/lang/Object":
+            return None
         return next((item for item in extractor.classes.values()
                      if item.name == name), None)
 
@@ -1410,7 +1431,7 @@ def infer_quick_field_owners(extractor: ROMExtractor, info: ClassInfo,
             slot = value & 0xffff
             if owner is None or slot >= owner.vtable_length:
                 return None
-            pointer = extractor.image.u32(owner.info_pointer + 40 + slot * 4)
+            pointer = extractor.image.u32(owner.vtable_pointer + slot * 4)
             return extractor.parse_method(pointer)
         except (IndexError, ValueError):
             return None
@@ -1627,22 +1648,19 @@ def recover_method_body(extractor: ROMExtractor, info: ClassInfo,
         elif inferred_descriptor == "B" and value_descriptor == "Z":
             inferred_descriptor = "Z"
         if inferred_descriptor == "Ljava/lang/Object;":
+            inferred_descriptor = (direct_field_descriptor(bci) or
+                                   inferred_descriptor)
+        if inferred_descriptor == "Ljava/lang/Object;" and owner is info:
             inferred_descriptor = reference_types.get(byte_offset, inferred_descriptor)
         if not owner.fields:
             extractor.parse_class(owner)
         candidates = [field for field in owner.fields
                       if not (field.access & ACC_STATIC) and
                       field.offset == byte_offset]
-        if candidates:
-            field_info = candidates[0]
-            if (field_info.synthetic_name and
-                    field_info.descriptor == "Ljava/lang/Object;" and
-                    inferred_descriptor != "Ljava/lang/Object;"):
-                field_info.descriptor = inferred_descriptor
-            elif (field_info.synthetic_name and field_info.descriptor == "B" and
-                  inferred_descriptor == "Z"):
-                field_info.descriptor = "Z"
-        else:
+        field_info = next((field for field in candidates
+                           if _descriptor_matches(field.descriptor,
+                                                  inferred_descriptor)), None)
+        if field_info is None:
             field_info = FieldInfo(
                 ACC_PRIVATE | ACC_SYNTHETIC_ROM,
                 f"field{byte_offset:04X}{descriptor_name(inferred_descriptor)}",
@@ -1669,7 +1687,13 @@ def recover_method_body(extractor: ROMExtractor, info: ClassInfo,
             extractor.parse_class(owner)
         candidates = [field for field in owner.fields
                       if field.access & ACC_STATIC and field.offset == byte_offset]
-        if not candidates:
+        field_info = next((field for field in candidates
+                           if not field.synthetic_name), None)
+        if field_info is None:
+            field_info = next((field for field in candidates
+                               if _descriptor_matches(field.descriptor,
+                                                      inferred_descriptor)), None)
+        if field_info is None:
             field_info = FieldInfo(
                 ACC_PRIVATE | ACC_STATIC | ACC_SYNTHETIC_ROM,
                 f"staticField{byte_offset:04X}{descriptor_name(inferred_descriptor)}",
@@ -1679,16 +1703,13 @@ def recover_method_body(extractor: ROMExtractor, info: ClassInfo,
                 True,
             )
             owner.fields.append(field_info)
-        else:
-            # The no-stack-tags opcodes erase int/float and long/double
-            # distinctions; a retained field entry supplies the exact type.
-            field_info = candidates[0]
         field_name = emitted_member_name(field_info.name, field_info.offset,
                                          "field", field_info.descriptor,
                                          bool(field_info.access & ACC_STATIC))
         return cp.fieldref(owner.name, field_name, field_info.descriptor)
 
-    def resolved_instance_fieldref(rom_cp_index: int) -> int:
+    def resolved_instance_fieldref(rom_cp_index: int, bci: int,
+                                   is_get: bool) -> int:
         value = rom_entry(rom_cp_index)
         byte_offset = value >> 16
         class_id = value & 0xffff
@@ -1699,9 +1720,20 @@ def recover_method_body(extractor: ROMExtractor, info: ClassInfo,
             extractor.parse_class(owner)
         candidates = [field for field in owner.fields
                       if not (field.access & ACC_STATIC) and field.offset == byte_offset]
-        if not candidates:
+        inferred = direct_field_descriptor(bci) if is_get else None
+        field_info = (next((field for field in candidates
+                            if inferred and
+                            _descriptor_matches(field.descriptor, inferred)), None)
+                      or next((field for field in candidates
+                               if not field.synthetic_name), None))
+        if field_info is None and inferred:
+            field_info = FieldInfo(
+                ACC_PRIVATE | ACC_SYNTHETIC_ROM,
+                f"field{byte_offset:04X}{descriptor_name(inferred)}",
+                inferred, 0, byte_offset, True)
+            owner.fields.append(field_info)
+        if field_info is None:
             raise ValueError(f"instance field class={class_id} offset={byte_offset} is unavailable")
-        field_info = candidates[0]
         name = emitted_member_name(field_info.name, field_info.offset, "field",
                                    field_info.descriptor,
                                    bool(field_info.access & ACC_STATIC))
@@ -1724,7 +1756,7 @@ def recover_method_body(extractor: ROMExtractor, info: ClassInfo,
             owner = extractor.classes.get(class_id)
             if owner is None or vtable_index >= owner.vtable_length:
                 raise ValueError(f"invalid vtable reference class={class_id} slot={vtable_index}")
-            pointer = extractor.image.u32(owner.info_pointer + 40 + vtable_index * 4)
+            pointer = extractor.image.u32(owner.vtable_pointer + vtable_index * 4)
         target = extractor.parse_method(pointer)
         owner = extractor.classes.get(target.holder_id)
         if owner is not None:
@@ -1742,6 +1774,139 @@ def recover_method_body(extractor: ROMExtractor, info: ClassInfo,
             else:
                 target = canonical
         return target
+
+    def direct_field_descriptor(start_bci: int) -> Optional[str]:
+        """Infer a quick field type from its immediate stack consumers.
+
+        ROMizer erases reference field types. Preserve the field value's
+        origin through array loads and argument setup until a typed operation
+        constrains it. This also recovers multidimensional arrays.
+        """
+        marker: tuple[str, int] = ("field", 0)
+        stack: list[Optional[tuple[str, int]]] = [marker]
+        locals_: dict[int, Optional[tuple[str, int]]] = {}
+        best: Optional[str] = None
+
+        def pop() -> Optional[tuple[str, int]]:
+            return stack.pop() if stack else None
+
+        def constrained(item: Optional[tuple[str, int]],
+                        descriptor: str) -> Optional[str]:
+            if item is None:
+                return None
+            return "[" * item[1] + descriptor
+
+        cursor = start_bci + bytecode_length(method.code, start_bci)
+        for _ in range(32):
+            if cursor >= len(method.code):
+                break
+            opcode = method.code[cursor]
+            length = bytecode_length(method.code, cursor)
+
+            if opcode == 0x01 or 0x02 <= opcode <= 0x14 or opcode in {
+                    0xcb, 0xcc, 0xcd, 0xbb, 0xe8}:
+                stack.append(None)
+            elif opcode in {0x15, 0x16, 0x17, 0x18, 0x19}:
+                index = method.code[cursor + 1]
+                stack.append(locals_.get(index))
+            elif 0x1a <= opcode <= 0x2d:
+                index = ((opcode - 0x1a) & 3)
+                stack.append(locals_.get(index))
+            elif opcode in {0x36, 0x37, 0x38, 0x39, 0x3a}:
+                locals_[method.code[cursor + 1]] = pop()
+            elif 0x3b <= opcode <= 0x4e:
+                locals_[(opcode - 0x3b) & 3] = pop()
+            elif opcode == 0x57:
+                if pop() is not None:
+                    break
+            elif opcode == 0x58:
+                if pop() is not None or pop() is not None:
+                    break
+            elif opcode == 0x59 and stack:
+                stack.append(stack[-1])
+            elif opcode in ARRAY_DESCRIPTOR_BY_OPCODE:
+                pop()  # index or value
+                if opcode >= 0x4f:
+                    pop()  # index
+                item = pop()
+                descriptor = constrained(
+                    item, ARRAY_DESCRIPTOR_BY_OPCODE[opcode])
+                if descriptor is not None:
+                    best = descriptor
+                if opcode == 0x32 and item is not None:
+                    stack.append((item[0], item[1] + 1))
+                elif opcode < 0x36:
+                    stack.append(None)
+            elif opcode == 0xbe:
+                item = pop()
+                descriptor = constrained(item, "[Ljava/lang/Object;")
+                if descriptor is not None:
+                    best = descriptor
+                stack.append(None)
+            elif opcode in {0xc0, 0xea}:
+                item = pop()
+                index = int.from_bytes(method.code[cursor + 1:cursor + 3], "big")
+                class_id = rom_entry(index)
+                target = extractor.classes.get(class_id)
+                name = (target.name if target and target.name else
+                        CORE_ARRAY_BY_CLASS_ID.get(class_id))
+                if name:
+                    expected = name if name.startswith("[") else f"L{name};"
+                    descriptor = constrained(item, expected)
+                    if descriptor is not None:
+                        return descriptor
+                stack.append(item)
+            elif opcode in {0xe2, 0xe3, 0xe6, 0xe7,
+                            0xb6, 0xb7, 0xb8}:
+                index = int.from_bytes(method.code[cursor + 1:cursor + 3], "big")
+                target = resolved_method(index, direct=(opcode == 0xe3))
+                for expected in reversed(descriptor_parameters(target.descriptor)):
+                    descriptor = constrained(pop(), expected)
+                    if descriptor is not None:
+                        return descriptor
+                if opcode not in {0xe3, 0xb8}:
+                    receiver = pop()
+                    owner = extractor.classes.get(target.holder_id)
+                    if owner and owner.name:
+                        descriptor = constrained(receiver, f"L{owner.name};")
+                        if descriptor is not None:
+                            return descriptor
+                result = target.descriptor[target.descriptor.rfind(")") + 1:]
+                if result != "V":
+                    stack.append(None)
+            elif opcode == 0xe4:
+                index = int.from_bytes(method.code[cursor + 1:cursor + 3], "big")
+                target = resolved_method(index, direct=False)
+                for expected in reversed(descriptor_parameters(target.descriptor)):
+                    descriptor = constrained(pop(), expected)
+                    if descriptor is not None:
+                        return descriptor
+                receiver = pop()
+                owner = extractor.classes.get(target.holder_id)
+                if owner and owner.name:
+                    descriptor = constrained(receiver, f"L{owner.name};")
+                    if descriptor is not None:
+                        return descriptor
+                result = target.descriptor[target.descriptor.rfind(")") + 1:]
+                if result != "V":
+                    stack.append(None)
+            elif opcode in {0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e,
+                            0xc6, 0xc7}:
+                if pop() is not None:
+                    break
+            elif 0x9f <= opcode <= 0xa6:
+                if pop() is not None or pop() is not None:
+                    break
+            elif opcode in {0xac, 0xad, 0xae, 0xaf, 0xb0}:
+                item = pop()
+                if item is not None:
+                    result = method.descriptor[method.descriptor.rfind(")") + 1:]
+                    return constrained(item, result)
+                break
+            elif opcode in {0xaa, 0xab, 0xa7, 0xa8, 0xc8, 0xc9, 0xbf}:
+                break
+            cursor += length
+        return best
 
     def methodref(target: MethodInfo) -> int:
         owner = extractor.classes.get(target.holder_id)
@@ -1809,6 +1974,38 @@ def recover_method_body(extractor: ROMExtractor, info: ClassInfo,
                 return kind_from_descriptor(params[-1], two_word)
         return None
 
+    def static_descriptor(bci: int, is_put: bool) -> str:
+        """Recover the erased type of an unquickened static field access."""
+        if not is_put:
+            wide = infer_numeric_ldc_kind(method.code, bci, two_word=True)
+            if wide == "long":
+                return "J"
+            if wide == "double":
+                return "D"
+            narrow = infer_numeric_ldc_kind(method.code, bci, two_word=False)
+            if narrow == "float":
+                return "F"
+            return "I"
+
+        previous = instructions[-1][2] if instructions else -1
+        if previous in ({0x09, 0x0a, 0x16, 0x1e, 0x1f, 0x20, 0x21,
+                         0x2f, 0x61, 0x65, 0x69, 0x6d, 0x71, 0x75,
+                         0x79, 0x7b, 0x7d, 0x7f, 0x81, 0x83, 0x85,
+                         0x8c, 0x8f, 0x94}):
+            return "J"
+        if previous in ({0x0e, 0x0f, 0x18, 0x26, 0x27, 0x28, 0x29,
+                         0x31, 0x63, 0x67, 0x6b, 0x6f, 0x73, 0x77,
+                         0x87, 0x8a, 0x8d, 0x97, 0x98}):
+            return "D"
+        if previous in ({0x0b, 0x0c, 0x0d, 0x17, 0x22, 0x23, 0x24,
+                         0x25, 0x30, 0x62, 0x66, 0x6a, 0x6e, 0x72,
+                         0x76, 0x86, 0x8b, 0x90, 0x95, 0x96}):
+            return "F"
+        if previous in ({0x01, 0x19, 0x2a, 0x2b, 0x2c, 0x2d, 0x32,
+                         0xbb, 0xbd, 0xc0, 0xe8, 0xe9, 0xea}):
+            return "Ljava/lang/Object;"
+        return "I"
+
     # (old bci, new bci, opcode, old length, initial replacement)
     instructions: list[tuple[int, int, int, int, bytes]] = []
     old_to_new: dict[int, int] = {}
@@ -1823,7 +2020,18 @@ def recover_method_body(extractor: ROMExtractor, info: ClassInfo,
             if length <= 0 or bci + length > len(method.code):
                 raise ValueError("instruction extends beyond method")
             replacement = method.code[bci:bci + length]
-            if opcode in {0xcb, 0xcc}:
+            if (opcode == 0x04 and bci + 1 < len(method.code) and
+                    method.code[bci + 1] == 0x79):
+                # Fernflower incorrectly widens the iconst shift count in
+                # some old CLDC loop shapes and then casts Integer to Long
+                # while rendering. Multiplication by two has the same JVM
+                # two's-complement result as `lshl 1`.
+                cp_index = cp.wide_bits(2, is_double=False)
+                replacement = b"\x14" + struct.pack(">H", cp_index)
+            elif (opcode == 0x79 and bci > 0 and
+                  method.code[bci - 1] == 0x04):
+                replacement = b"\x69"  # lmul
+            elif opcode in {0xcb, 0xcc}:
                 rom_cp_index = (method.code[bci + 1] if opcode == 0xcb else
                                 int.from_bytes(method.code[bci + 1:bci + 3], "big"))
                 value = rom_entry(rom_cp_index)
@@ -1998,11 +2206,13 @@ def recover_method_body(extractor: ROMExtractor, info: ClassInfo,
                 replacement = b"\x14" + struct.pack(">H", cp_index)
             elif opcode in {0xb2, 0xb3}:
                 rom_cp_index = int.from_bytes(method.code[bci + 1:bci + 3], "big")
-                cp_index = static_fieldref(rom_cp_index, "I")
+                cp_index = static_fieldref(
+                    rom_cp_index, static_descriptor(bci, opcode == 0xb3))
                 replacement = bytes([opcode]) + struct.pack(">H", cp_index)
             elif opcode in {0xb4, 0xb5}:
                 rom_cp_index = int.from_bytes(method.code[bci + 1:bci + 3], "big")
-                cp_index = resolved_instance_fieldref(rom_cp_index)
+                cp_index = resolved_instance_fieldref(
+                    rom_cp_index, bci, opcode == 0xb4)
                 replacement = bytes([opcode]) + struct.pack(">H", cp_index)
             elif opcode in {0xbb, 0xbd, 0xc0, 0xc1}:
                 rom_cp_index = int.from_bytes(method.code[bci + 1:bci + 3], "big")
