@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Recover classes from a phoneME source-ROM image.
+"""Recover classes from phoneME and C166 KVM source-ROM images.
 
-This targets the CLDC HotSpot source ROMizer layout used by Siemens phones.
+This supports CLDC HotSpot (SGOLD) and C166 KVM (EGOLD) source ROMizer layouts.
 It emits valid class files and a Ghidra native-symbol file. By default it
 rebuilds class-file constant pools and dequickens retained method bodies. JSON
 metadata is available as an explicit option.
@@ -2584,6 +2584,597 @@ def write_native_symbols(extractor: ROMExtractor, path: Path) -> tuple[int, int]
     return len(rows), quick_count
 
 
+@dataclass
+class KVMClass:
+    offset: int
+    name: str
+    key: int
+    access: int
+    methods: list[int] = field(default_factory=list)
+    fields: list[int] = field(default_factory=list)
+
+
+class KVMExtractor:
+    """Read 32-bit-cell KVM ROMs with C166 huge data pointers.
+
+    Offsets here are file offsets. Data pointers use 16 KiB pages; native
+    function pointers use 64 KiB code segments and are already linear.
+    Class blocks and static storage are copied to RAM at boot. Discover their
+    separate ROM-to-RAM mappings from owner references and the static roots.
+    """
+
+    def __init__(self, data: bytes, base: int = 0x200000):
+        self.data = data
+        self.base = base
+        self.symbols: dict[int, tuple[int, bytes]] = {}
+        self.names: dict[int, bytes] = {}
+        self.classes: dict[int, KVMClass] = {}
+        self.class_keys: dict[int, KVMClass] = {}
+        self.ram_classes: dict[int, KVMClass] = {}
+        self.members: dict[int, tuple[KVMClass, int, bool]] = {}
+        self.symbol_table: int | None = None
+        self.class_table: int | None = None
+        self.class_delta: int | None = None
+        self.static_delta: int | None = None
+        self.warnings: list[str] = []
+        self.normalized_methods: set[int] = set()
+
+    def check(self, offset: int, size: int) -> int:
+        if offset < 0 or size < 0 or offset + size > len(self.data):
+            raise ValueError(f"KVM data outside firmware: offset={offset:#x}, size={size}")
+        return offset
+
+    def u16(self, offset: int) -> int:
+        return struct.unpack_from('<H', self.data, self.check(offset, 2))[0]
+
+    def u32(self, offset: int) -> int:
+        return struct.unpack_from('<I', self.data, self.check(offset, 4))[0]
+
+    @staticmethod
+    def linear(pointer: int) -> int:
+        return (pointer >> 16) * 0x4000 + (pointer & 0xffff)
+
+    def off(self, pointer: int, size: int = 1) -> int:
+        return self.check(self.linear(pointer) - self.base, size)
+
+    def find_symbols(self) -> bool:
+        """Validate the entire 256-bucket UTF table, not a nearby string hit."""
+        hits = []
+        for match in re.finditer(b'\x00\x01\x00\x00', self.data):
+            start = match.start()
+            if start & 1 or start + 1032 > len(self.data):
+                continue
+            count = self.u32(start + 4)
+            if not 16 <= count <= 0xff00:
+                continue
+            symbols = {}
+            keys = set()
+            try:
+                for bucket in range(256):
+                    pointer = self.u32(start + 8 + bucket * 4)
+                    previous_key = None
+                    while pointer:
+                        offset = self.off(pointer, 9)
+                        if offset in symbols or len(symbols) >= count:
+                            raise ValueError('cyclic or oversized symbol chain')
+                        length, key = self.u16(offset + 4), self.u16(offset + 6)
+                        self.check(offset + 8, length + 1)
+                        raw = self.data[offset + 8:offset + 8 + length]
+                        hash_value = 0
+                        for byte in raw:
+                            hash_value = (hash_value * 37 + byte) & 0xff
+                        if (key < 256 or key in keys or key % 256 != bucket or
+                                hash_value != bucket or self.data[offset + 8 + length] or
+                                (previous_key is not None and key != previous_key - 256)):
+                            raise ValueError('invalid UTF hash chain')
+                        keys.add(key)
+                        symbols[offset] = (key, raw)
+                        previous_key = key
+                        pointer = self.u32(offset)
+                    if previous_key is not None and previous_key >= 512:
+                        raise ValueError('incomplete UTF hash chain')
+                if len(symbols) == count:
+                    hits.append((start, symbols))
+            except ValueError:
+                continue
+        if not hits:
+            return False
+        if len(hits) != 1:
+            raise ValueError('multiple KVM UTF tables; split the firmware image')
+        self.symbol_table, self.symbols = hits[0]
+        self.names = {key: raw for key, raw in self.symbols.values()}
+        return True
+
+    def symbol(self, pointer: int) -> bytes:
+        return self.symbols[self.off(pointer)][1]
+
+    def table(self, pointer: int, stride: int) -> list[int]:
+        if not pointer:
+            return []
+        offset = self.off(pointer, 4)
+        count = self.u32(offset)
+        if count > 65535:
+            raise ValueError('oversized KVM member table')
+        self.check(offset + 4, count * stride)
+        return list(range(offset + 4, offset + 4 + count * stride, stride))
+
+    def scan_classes(self) -> None:
+        if not self.symbols and not self.find_symbols():
+            raise ValueError('C166 KVM UTF table not found')
+        # A baseName pointer is the anchor; validate the rest of each candidate.
+        symbol_offsets = set(self.symbols)
+        for offset in range(0, len(self.data) - 55, 2):
+            base_offset = self.linear(self.u32(offset + 12)) - self.base
+            if base_offset not in symbol_offsets or self.u32(offset + 4):
+                continue
+            try:
+                raw = self.symbols[base_offset][1].decode('utf-8')
+                package_pointer = self.u32(offset + 8)
+                package = self.symbol(package_pointer).decode('utf-8') if package_pointer else ''
+                if not re.fullmatch(r'[A-Za-z_$][\w$/]*', package or 'x'):
+                    continue
+                if not re.fullmatch(r'[\w$;\[/]+', raw):
+                    continue
+                access, key = self.u16(offset + 20), self.u16(offset + 22)
+                if not access & 0x2000 or key < 256:
+                    continue
+                if raw.startswith('['):
+                    index = raw.find('L')
+                    name = (raw[:index + 1] + package + '/' + raw[index + 1:]
+                            if index >= 0 and package else raw)
+                    info = KVMClass(offset, name, key, access)
+                    if not access & 0x1000:
+                        continue
+                else:
+                    if access & 0x1000 or self.u16(offset + 50) > 5:
+                        continue
+                    for pos in (28, 40):
+                        if self.u32(offset + pos):
+                            self.off(self.u32(offset + pos), 4)
+                    info = KVMClass(offset, package + '/' + raw if package else raw, key, access)
+                    info.methods = self.table(self.u32(offset + 36), 32)
+                    info.fields = self.table(self.u32(offset + 32), 16)
+                    if any(self.u16(m) not in self.names or self.u16(m + 2) not in self.names
+                           for m in info.methods):
+                        continue
+                    if any(self.u16(f) not in self.names for f in info.fields):
+                        continue
+                self.classes[offset] = info
+            except (ValueError, KeyError, UnicodeError):
+                continue
+        deltas = collections.Counter()
+        for info in self.classes.values():
+            for is_method, entries, owner_offset in ((True, info.methods, 24), (False, info.fields, 8)):
+                for member in entries:
+                    deltas[info.offset - self.linear(self.u32(member + owner_offset))] += 1
+                    self.members[member] = (info, member, is_method)
+        if len(deltas) != 1 or not any(c.name == 'java/lang/Object' for c in self.classes.values()):
+            raise ValueError(f'inconsistent KVM class relocation: {dict(deltas)}')
+        self.class_delta = next(iter(deltas))
+        self.ram_classes = {o - self.class_delta: c for o, c in self.classes.items()}
+        self.class_keys = {c.key: c for c in self.classes.values()}
+        if len(self.class_keys) != len(self.classes):
+            raise ValueError('duplicate KVM class keys')
+        # Cross-check discovery against the VM's class hash table, including
+        # methodless classes and arrays. Do not silently emit a partial scan.
+        tables = []
+        pattern = re.escape(struct.pack('<II', 32, len(self.classes)))
+        for match in re.finditer(pattern, self.data):
+            start = match.start()
+            seen = set()
+            try:
+                for bucket in range(32):
+                    pointer = self.u32(start + 8 + bucket * 4)
+                    while pointer:
+                        info = self.class_at(pointer)
+                        if info.offset in seen:
+                            raise ValueError('cyclic class hash chain')
+                        seen.add(info.offset)
+                        pointer = self.u32(info.offset + 16)
+                if seen == set(self.classes):
+                    tables.append(start)
+            except ValueError:
+                continue
+        if len(tables) != 1:
+            raise ValueError('KVM class scan does not match a unique complete class hash table')
+        self.class_table = tables[0]
+        for info in self.classes.values():
+            if not info.name.startswith('['):
+                if self.u32(info.offset + 24):
+                    self.class_at(self.u32(info.offset + 24))
+                for member in info.methods + info.fields:
+                    self.member_name(member)
+                    self.descriptor(member, member in info.methods)
+        self.find_statics()
+
+    def class_at(self, pointer: int) -> KVMClass:
+        try:
+            return self.ram_classes[self.linear(pointer)]
+        except KeyError as error:
+            raise ValueError(f'unresolved KVM class pointer {pointer:#x}') from error
+
+    def field_type(self, key: int) -> str:
+        depth, base = key >> 13, key & 0x1fff
+        if depth == 7:
+            return self.class_keys[key].name
+        if base < 256:
+            if chr(base) not in 'ZBCSIJFDV' or (depth and base == ord('V')):
+                raise ValueError(f'invalid KVM primitive key {key:#x}')
+            name = chr(base)
+        else:
+            name = 'L' + self.class_keys[base].name + ';'
+        return '[' * depth + name
+
+    def member_name(self, offset: int) -> str:
+        name = self.names[self.u16(offset)].decode('utf-8')
+        if not re.fullmatch(r'[\w$]+|<init>|<clinit>', name):
+            raise ValueError(f'invalid KVM member name {name!r}')
+        return name
+
+    def descriptor(self, offset: int, method: bool) -> str:
+        key = self.u16(offset + 2)
+        if not method:
+            descriptor = self.field_type(key)
+            if descriptor == 'V':
+                raise ValueError('void field')
+            return descriptor
+        raw = self.names[key]
+        pos = 1
+        types = []
+        for _ in range(raw[0] + 1):
+            if pos >= len(raw):
+                raise ValueError('truncated KVM signature')
+            tag = raw[pos]
+            pos += 1
+            if tag in b'ZBCSIJFDV':
+                value = chr(tag)
+            else:
+                if tag == ord('L'):
+                    tag = raw[pos]
+                    pos += 1
+                value = self.field_type(tag * 256 + raw[pos])
+                pos += 1
+            types.append(value)
+        if pos != len(raw) or 'V' in types[:-1]:
+            raise ValueError('invalid KVM signature')
+        return '(' + ''.join(types[:-1]) + ')' + types[-1]
+
+    def string(self, pointer: int) -> str:
+        offset = self.off(pointer, 24)
+        if self.class_at(self.u32(offset)).name != 'java/lang/String' or self.u32(offset + 4):
+            raise ValueError('not a ROM String object')
+        array = self.off(self.u32(offset + 8), 12)
+        if self.class_at(self.u32(array)).name != '[C':
+            raise ValueError('not a ROM char array')
+        start, length = self.u32(offset + 12), self.u32(offset + 16)
+        if start + length > self.u32(array + 8):
+            raise ValueError('ROM string outside char array')
+        data = self.check(array + 12 + start * 2, length * 2)
+        return self.data[data:data + length * 2].decode('utf-16le', 'surrogatepass')
+
+    def find_statics(self) -> None:
+        fields = [f for c in self.classes.values() for f in c.fields if self.u32(f + 4) & 8]
+        if not fields:
+            return
+        refs = [f for f in fields if self.u32(f + 4) & 0x8000]
+        first = min(self.linear(self.u32(f + 12)) for f in fields) - 4
+        last = max(self.linear(self.u32(f + 12)) + (8 if self.u32(f + 4) & 0x4000 else 4)
+                   for f in fields)
+        root_addresses = sorted(self.linear(self.u32(f + 12)) for f in refs)
+        if root_addresses != list(range(first + 4, first + 4 + len(refs) * 4, 4)):
+            self.warnings.append('static roots are not contiguous; constant values not recovered')
+            return
+        hits = []
+        pattern = re.escape(struct.pack('<I', len(refs)))
+        for match in re.finditer(pattern, self.data):
+            offset = match.start()
+            if offset & 1 or offset + last - first > len(self.data):
+                continue
+            try:
+                nonzero = 0
+                for index in range(len(refs)):
+                    pointer = self.u32(offset + 4 + index * 4)
+                    if pointer:
+                        self.string(pointer)
+                        nonzero += 1
+                if nonzero >= 2:
+                    hits.append(offset)
+            except ValueError:
+                continue
+        if len(hits) == 1:
+            self.static_delta = hits[0] - first
+        else:
+            self.warnings.append(f'static initializer table ambiguous ({len(hits)} matches); values not recovered')
+
+    def pool(self, info: KVMClass) -> tuple[ConstantPoolBuilder, list[int]]:
+        pointer = self.u32(info.offset + 28)
+        offset = self.off(pointer, 4) if pointer else None
+        count = self.u32(offset) if offset is not None else 1
+        if not 1 <= count <= 65535:
+            raise ValueError('invalid KVM constant pool length')
+        tags = list(self.data[self.check(offset + count * 4, count):offset + count * 5]) if offset is not None else [0]
+        cp = ConstantPoolBuilder()
+        # Reserve ROM indices so ldc stays narrow and all branch/switch/handler
+        # offsets remain unchanged. Additional UTF8/name-and-type entries follow.
+        cp.entries = [b'\x03\0\0\0\0'] * (count - 1)
+        index = 1
+        while index < count:
+            tag = tags[index]
+            value = self.u32(offset + index * 4)
+            if tag in (3, 4):
+                result = cp.integer_bits(value) if tag == 3 else cp.float_bits(value)
+            elif tag in (5, 6):
+                if index + 1 >= count or tags[index + 1] != 0:
+                    raise ValueError('invalid wide KVM constant')
+                bits = value << 32 | self.u32(offset + (index + 1) * 4)
+                result = cp.wide_bits(bits, tag == 6)
+                cp.entries[index] = b''
+            elif tag == 8:
+                result = cp.string(self.string(value))
+            elif tag == 0x87:
+                result = cp.klass(self.class_at(value).name)
+            elif tag in (0x89, 0x8a, 0x8b):
+                member = self.off(value)
+                if member not in self.members:
+                    raise ValueError(f'unresolved KVM member {value:#x}')
+                owner, member, is_method = self.members[member]
+                if is_method != (tag != 0x89):
+                    raise ValueError('KVM reference kind mismatch')
+                name, desc = self.member_name(member), self.descriptor(member, is_method)
+                result = (cp.methodref(owner.name, name, desc, tag == 0x8b) if is_method
+                          else cp.fieldref(owner.name, name, desc))
+            else:
+                raise ValueError(f'unsupported KVM constant tag {tag:#x} at index {index}')
+            cp.entries[index - 1] = cp.entries[result - 1]
+            index += 2 if tag in (5, 6) else 1
+        return cp, tags
+
+    def constant_value(self, member: int, cp: ConstantPoolBuilder) -> int | None:
+        access = self.u32(member + 4)
+        if self.static_delta is None or access & 0x18 != 0x18:
+            return None
+        desc = self.descriptor(member, False)
+        offset = self.linear(self.u32(member + 12)) + self.static_delta
+        value = self.u32(offset)
+        if desc in ('J', 'D'):
+            bits = value | self.u32(offset + 4) << 32
+            return cp.wide_bits(bits, desc == 'D')
+        if desc == 'F':
+            return cp.float_bits(value)
+        if desc in ('Z', 'B', 'C', 'S', 'I'):
+            return cp.integer_bits(value)
+        if desc == 'Ljava/lang/String;' and value:
+            return cp.string(self.string(value))
+        return None
+
+    def body(self, member: int, tags: list[int]) -> tuple[bytes, bytes, int, int]:
+        length = self.u16(member + 16)
+        offset = self.off(self.u32(member + 4), length)
+        code = self.data[offset:offset + length]
+        owner = self.members[member][0]
+        if (owner.name == 'java/lang/Class' and self.member_name(member) == 'runCustomCode' and
+                self.descriptor(member, True) == '()V' and code == b'\xdf'):
+            # KVMWriter replaces the empty Java placeholder's return with
+            # CUSTOMCODE, a VM callback dispatch with no class-file equivalent.
+            code = b'\xb1'
+            self.normalized_methods.add(member)
+        if not length:
+            raise ValueError('empty non-native KVM method')
+        pos = 0
+        boundaries = set()
+        jump_targets = []
+        while pos < length:
+            boundaries.add(pos)
+            opcode = code[pos]
+            if opcode > 0xc9 or opcode == 0xba:
+                raise ValueError(f'unsupported KVM opcode {opcode:#x} at {pos}')
+            size = 5 if opcode == 0xc9 else bytecode_length(code, pos)
+            if pos + size > length:
+                raise ValueError('truncated KVM instruction')
+            if 0x99 <= opcode <= 0xa8 or opcode in (0xc6, 0xc7, 0xc8, 0xc9):
+                width = 4 if opcode in (0xc8, 0xc9) else 2
+                jump_targets.append(pos + int.from_bytes(code[pos + 1:pos + 1 + width], 'big', signed=True))
+            elif opcode in (0xaa, 0xab):
+                aligned = (pos + 4) & ~3
+                positions = [aligned]
+                if opcode == 0xaa:
+                    positions.extend(range(aligned + 12, pos + size, 4))
+                else:
+                    positions.extend(range(aligned + 12, pos + size, 8))
+                jump_targets.extend(pos + int.from_bytes(code[p:p + 4], 'big', signed=True) for p in positions)
+            elif opcode == 0xc4 and code[pos + 1] not in (*range(21, 26), *range(54, 59), 132, 169):
+                raise ValueError('invalid wide instruction')
+            elif opcode == 0xbc and not 4 <= code[pos + 1] <= 11:
+                raise ValueError('invalid primitive array type')
+            if opcode in JVM_CP_OPCODES:
+                index = code[pos + 1] if opcode == 18 else int.from_bytes(code[pos + 1:pos + 3], 'big')
+                expected = ({18: (3, 4, 8), 19: (3, 4, 8), 20: (5, 6),
+                             178: (0x89,), 179: (0x89,), 180: (0x89,), 181: (0x89,),
+                             182: (0x8a,), 183: (0x8a,), 184: (0x8a,), 185: (0x8b,)}
+                            .get(opcode, (0x87,)))
+                if not 0 < index < len(tags) or tags[index] not in expected:
+                    raise ValueError(f'bad KVM CP operand at {pos}: {index}')
+            pos += size
+        if any(target not in boundaries for target in jump_targets):
+            raise ValueError('KVM branch target is not an instruction boundary')
+        handlers = []
+        pointer = self.u32(member + 8)
+        for entry in self.table(pointer, 8):
+            start, end, target, exception = struct.unpack_from('<4H', self.data, entry)
+            if (start not in boundaries or end not in boundaries | {length} or start >= end or
+                    target not in boundaries or exception >= len(tags) or
+                    (exception and tags[exception] != 0x87)):
+                raise ValueError('invalid KVM exception handler')
+            handlers.append(struct.pack('>4H', start, end, target, exception))
+        exception_bytes = struct.pack('>H', len(handlers)) + b''.join(handlers)
+        return code, exception_bytes, self.u16(member + 18), self.u16(member + 28)
+
+    def build_class(self, info: KVMClass, recover_bodies: bool = True) -> tuple[bytes, int]:
+        cp, tags = self.pool(info)
+        this = cp.klass(info.name)
+        parent = self.u32(info.offset + 24)
+        superclass = cp.klass(self.class_at(parent).name) if parent else 0
+        interfaces = []
+        pointer = self.u32(info.offset + 40)
+        if pointer:
+            offset = self.off(pointer, 2)
+            for i in range(self.u16(offset)):
+                index = self.u16(offset + 2 + i * 2)
+                if not 0 < index < len(tags) or tags[index] != 0x87:
+                    raise ValueError('invalid KVM interface CP index')
+                interfaces.append(index)
+        fields = []
+        initialized_in_code = set()
+        # ROM static storage includes zero defaults for final fields initialized
+        # by <clinit>. These are not ConstantValue attributes in a class file.
+        for method in info.methods:
+            if self.member_name(method) != '<clinit>':
+                continue
+            code, _, _, _ = self.body(method, tags)
+            pos = 0
+            while pos < len(code):
+                if code[pos] == 0xb3:
+                    index = int.from_bytes(code[pos + 1:pos + 3], 'big')
+                    pool = self.off(self.u32(info.offset + 28))
+                    initialized_in_code.add(self.off(self.u32(pool + index * 4)))
+                pos += bytecode_length(code, pos)
+        for member in info.fields:
+            attrs = b''
+            value = None if member in initialized_in_code else self.constant_value(member, cp)
+            if value is not None:
+                attrs = struct.pack('>HIH', cp.utf8('ConstantValue'), 2, value)
+            fields.append(struct.pack('>4H', self.u32(member + 4) & 0xdf,
+                                      cp.utf8(self.member_name(member)), cp.utf8(self.descriptor(member, False)),
+                                      int(bool(attrs))) + attrs)
+        methods = []
+        recovered = 0
+        for member in info.methods:
+            access = self.u32(member + 20) & 0xd3f
+            name, desc = self.member_name(member), self.descriptor(member, True)
+            attrs = b''
+            if not access & (0x100 | 0x400):
+                if recover_bodies:
+                    code, exceptions, stack, locals_count = self.body(member, tags)
+                    recovered += 1
+                else:
+                    # Deliberately fail loudly instead of inventing behavior.
+                    code, exceptions, stack = b'\x01\xbf', b'\0\0', 1
+                    locals_count = self.u16(member + 28)
+                body = struct.pack('>HHI', stack, locals_count, len(code)) + code + exceptions + b'\0\0'
+                attrs = struct.pack('>HI', cp.utf8('Code'), len(body)) + body
+            methods.append(struct.pack('>4H', access, cp.utf8(name), cp.utf8(desc), int(bool(attrs))) + attrs)
+        result = (struct.pack('>IHH', 0xcafebabe, 0, 46) + cp.render() +
+                  struct.pack('>4H', info.access & 0x631, this, superclass, len(interfaces)) +
+                  b''.join(struct.pack('>H', index) for index in interfaces) +
+                  struct.pack('>H', len(fields)) + b''.join(fields) +
+                  struct.pack('>H', len(methods)) + b''.join(methods) + b'\0\0')
+        return result, recovered
+
+    def native_symbols(self) -> str:
+        rows = []
+        used = collections.Counter()
+        for info in sorted(self.classes.values(), key=lambda c: c.name):
+            for member in info.methods:
+                if not self.u32(member + 20) & 0x100:
+                    continue
+                address = self.u32(member + 4)
+                if not 0 < address < 0x1000000 or address & 1:
+                    raise ValueError(f'invalid C166 native code pointer: {address:#x}')
+                offset = address - self.base
+                if (not 0 <= offset <= len(self.data) - 2 or
+                        self.data[offset:offset + 2] == b'\xff\xff'):
+                    warning = (f'{info.name}.{self.member_name(member)}: native target '
+                               f'{address:#x} is not backed by code in this dump; symbol retained')
+                    if warning not in self.warnings:
+                        self.warnings.append(warning)
+                name = self.member_name(member).replace('<', '').replace('>', '')
+                stem = re.sub('[^A-Za-z0-9_]', '_', info.name + '_' + name)
+                used[stem] += 1
+                name = stem if used[stem] == 1 else f'{stem}_{used[stem]}'
+                rows.append((address, name))
+        return ''.join(f'F\t{address:08X}\t{name}\n' for address, name in sorted(rows))
+
+
+def extract_kvm(args: argparse.Namespace, extractor: KVMExtractor) -> int:
+    if args.constant_pool_address is not None:
+        raise ValueError('--constant-pool-address is only supported for phoneME (KVM has per-class pools)')
+    extractor.scan_classes()
+    classes = {c.name: c for c in extractor.classes.values() if not c.name.startswith('[')}
+    object_address = extractor.base + classes['java/lang/Object'].offset
+    if args.structure_address is not None and args.structure_address != object_address:
+        raise ValueError(f'KVM Object structure is at {object_address:#x}, not {args.structure_address:#x}')
+    print(f'KVM ROM layout: base=0x{extractor.base:08X}, '
+          f'object_class=0x{object_address:08X}, '
+          f'utf_table=0x{extractor.base + extractor.symbol_table:08X}, '
+          f'class_table=0x{extractor.base + extractor.class_table:08X}, '
+          f'classes={len(classes)}, arrays={len(extractor.classes) - len(classes)}')
+    if args.list:
+        for name in sorted(classes):
+            print(f'{classes[name].key:4d} {name}')
+    list_only = args.list and not args.class_names and not args.all
+    names = (sorted(classes) if args.all else args.class_names if args.class_names else
+             [] if list_only else ['java/lang/Object'])
+    results = []
+    for name in names:
+        if name not in classes:
+            raise ValueError(f'class not found: {name}')
+        info = classes[name]
+        try:
+            data, recovered = extractor.build_class(info, args.recover_bodies)
+        except (ValueError, KeyError, IndexError, struct.error) as error:
+            raise ValueError(f'{name}: {error}') from error
+        results.append((info, data, recovered))
+    symbols = extractor.native_symbols()
+    for warning in extractor.warnings:
+        print(f'WARNING: {warning}')
+    args.output.mkdir(parents=True, exist_ok=True)
+    symbols_path = args.output / 'native-symbols.txt'
+    symbols_path.write_text(symbols)
+    print(f'native symbols: {len(symbols.splitlines())} functions -> {symbols_path}')
+    total = 0
+    for info, data, recovered in results:
+        path = args.output / (info.name + '.class')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        total += recovered
+        print(f'{info.name}: {len(info.fields)} fields, {len(info.methods)} methods, '
+              f'{recovered} emitted ROM bodies -> {path}')
+        if args.metadata:
+            details = {
+                'format': 'c166-kvm-source-rom-v1',
+                'name': info.name,
+                'class_key': info.key,
+                'class_address': f'0x{extractor.base + info.offset:08X}',
+                'ram_address': f'0x{info.offset - extractor.class_delta:08X}',
+                'fields': [{
+                    'name': extractor.member_name(f),
+                    'descriptor': extractor.descriptor(f, False),
+                    'access_rom': extractor.u32(f + 4),
+                    'rom_address': f'0x{extractor.base + f:08X}',
+                } for f in info.fields],
+                'methods': [{
+                    'name': extractor.member_name(m),
+                    'descriptor': extractor.descriptor(m, True),
+                    'access_rom': extractor.u32(m + 20),
+                    'rom_address': f'0x{extractor.base + m:08X}',
+                    'code_pointer': f'0x{extractor.u32(m + 4):08X}',
+                    'body_status': ('native' if extractor.u32(m + 20) & ACC_NATIVE else
+                                    'abstract' if extractor.u32(m + 20) & ACC_ABSTRACT else
+                                    'stub: recovery disabled' if not args.recover_bodies else
+                                    'normalized VM callback placeholder' if m in extractor.normalized_methods else
+                                    'original bytecode'),
+                } for m in info.methods],
+            }
+            path.with_suffix('.rom.json').write_text(json.dumps(details, indent=2) + '\n')
+    normalized = len(extractor.normalized_methods)
+    if normalized:
+        print('NOTE: java/lang/Class.runCustomCode() CUSTOMCODE dispatch restored '
+              'to the empty Java placeholder; VM callback behavior is not portable.')
+    print(f'KVM extraction: {len(results)} classes, {total} bodies '
+          f'({normalized} VM placeholders normalized), no implicit stubs')
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("firmware", type=Path)
@@ -2598,17 +3189,31 @@ def main() -> int:
                         help="place ROMizer-renamed classes in inferred packages")
     parser.add_argument("--metadata", action="store_true",
                         help="write optional adjacent .rom.json files")
-    parser.add_argument("--base-address", type=parse_address, default=FLASH_BASE,
-                        help="firmware base, e.g. A0000000 (default: A0000000)")
+    parser.add_argument("--format", choices=("auto", "phoneme", "kvm"), default="auto",
+                        help="ROM layout (default: auto; kvm selects C166/EGOLD)")
+    parser.add_argument("--base-address", type=parse_address,
+                        help="firmware base, e.g. A0000000 (default: phoneME A0000000; KVM 0x200000 or 0)")
     parser.add_argument("--structure-address", type=parse_address,
-                        help="java/lang/Object ClassInfo body address")
+                        help="java/lang/Object structure address in flash")
     parser.add_argument("--constant-pool-address", type=parse_address,
                         help="override the detected system ConstantPool address")
     parser.set_defaults(metadata=False)
     args = parser.parse_args()
 
+    if args.format != 'phoneme':
+        data = args.firmware.read_bytes()
+        for base in ([args.base_address] if args.base_address is not None else [0x200000, 0]):
+            kvm = KVMExtractor(data, base)
+            try:
+                if kvm.find_symbols():
+                    return extract_kvm(args, kvm)
+            except (ValueError, KeyError, IndexError, struct.error) as error:
+                raise SystemExit(f'KVM extraction failed: {error}') from error
+        if args.format == 'kvm':
+            raise SystemExit('KVM layout detection failed: UTF table not found; check --base-address')
+
     extractor = ROMExtractor(
-        Image(args.firmware, args.base_address),
+        Image(args.firmware, args.base_address if args.base_address is not None else FLASH_BASE),
         cp_pointer=args.constant_pool_address,
         structure_address=args.structure_address,
     )
